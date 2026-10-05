@@ -1,15 +1,27 @@
 # Interview
 
-A minimal Java 21 Spring Boot REST API with Jenkins CI, Podman containerization, and ELK observability configuration.
+A Java 21 Spring Boot REST API with Jenkins CI, Podman containerization, ELK logging, and Prometheus/Grafana monitoring. The current multi-container setup runs with Podman installed directly in Ubuntu WSL2.
 
 ## Prerequisites
 
 * Java 21
 * Maven
 * Windows with WSL 2
-* Podman Desktop
+* Podman installed directly in Ubuntu WSL2 for the current Compose setup
+* A Compose provider, such as `podman-compose` (`podman compose` delegates to it)
+* Podman Desktop for the earlier Windows-based workflow, if using that environment
 
 ## Set Java 21
+
+For the current Ubuntu WSL2 workflow, verify Java and Maven inside Ubuntu:
+
+```bash
+java -version
+mvn -version
+```
+
+Both should use Java 21. The following PowerShell configuration applies to the earlier Windows workflow.
+
 
 Update the JDK path for your local system:
 
@@ -50,11 +62,13 @@ The generated JAR is:
 target/interview-0.0.1-SNAPSHOT.jar
 ```
 
-## Local container execution with Podman Desktop
+## Earlier Windows container execution with Podman Desktop
 
 `Dockerfile.java21` packages the application as a Java 21 container image.
 
 > **Note:** Docker Desktop could not be installed because of organization security and web-access restrictions. Podman Desktop is used as a Docker-compatible alternative.
+
+This section records the earlier Windows/Podman Desktop workflow. For the current setup, run Podman directly in Ubuntu WSL2 and use the Compose commands in the observability section; a separate `podman machine` is not required for that workflow.
 
 ### Podman machine setup
 
@@ -126,14 +140,14 @@ After correcting the unit test, run the pipeline again and confirm a successful 
 
 ## ELK observability configuration
 
-`compose.observability.yaml` defines the following Elastic Stack components:
+`compose.observability.yaml` defines the application and observability stack. The Elastic Stack components are:
 
 * Elasticsearch
 * Kibana
 * Logstash
 * Filebeat
 
-All components use Elastic version `9.5.4`.
+The Elastic components use version `9.5.4` through `ELASTIC_VERSION`. The stack also includes `interview-service`, Prometheus, and Grafana.
 
 ### Download ELK images
 
@@ -160,11 +174,354 @@ docker.elastic.co/beats/filebeat:9.5.4
 
 ![ELK images pulled successfully](assets/observability/download-elk-pulled.png)
 
-### Compose bridge-network limitation
+### Environment history: Windows Desktop versus Ubuntu WSL2
 
-The ELK images download successfully through Podman. However, starting the multi-container Compose stack is currently blocked by a Podman-on-WSL `netavark`/`nftables` bridge-network error.
+The earlier laptop used the Windows Podman Desktop workflow. Running multiple containers through Compose encountered a `netavark`/`nftables` bridge-network error. A single application container was validated with rootless `pasta` networking; the native Windows ELK installation was used during that phase.
 
-The single-container application works successfully with rootless `pasta` networking. The ELK stack continues to run through the native Windows installation of Filebeat, Logstash, Elasticsearch, and Kibana.
+On another laptop, Podman was installed directly inside Ubuntu WSL2. The multi-container Compose stack ran without the earlier networking error. The application, Elasticsearch, Kibana, Logstash, Filebeat, Prometheus, and Grafana containers were observed running, and the Actuator endpoint, Prometheus scraping, and Grafana metrics queries were validated.
+
+This records a working environment change, not a confirmed fix on the original Windows Desktop environment. The earlier report linked [netavark issue #1495](https://github.com/containers/netavark/issues/1495); the link is retained as a troubleshooting reference, without claiming its current status or confirming it as the exact root cause.
+
+## Prometheus and Grafana monitoring
+
+### What each component does
+
+| Component | Role |
+| --- | --- |
+| Spring Boot Actuator and Micrometer | Expose current application/JVM measurements at `/actuator/prometheus` |
+| Prometheus | Fetch those measurements every 15 seconds and store them with timestamps |
+| Grafana | Query Prometheus and display saved dashboards |
+| Filebeat, Logstash, Elasticsearch, Kibana | Collect, process, store, and search application logs |
+
+Metrics are numeric measurements; they are separate from the log-file pipeline. The JVM metrics below do not measure total container or Windows host memory. Ubuntu host metrics and individual Podman container metrics require additional exporters.
+
+### Maven dependencies and Actuator exposure
+
+The application uses Spring Boot `3.5.0` and Java 21. Add these dependencies inside the existing `pom.xml` `<dependencies>` section; the Spring Boot parent manages their versions:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+For a local Maven run, use `src/main/resources/application.properties`:
+
+```properties
+management.endpoints.web.exposure.include=health,prometheus
+```
+
+For Compose, the equivalent setting goes alongside the existing logging setting in `interview-service`:
+
+```yaml
+environment:
+  LOGGING_FILE_NAME: /app/logs/interview.log
+  MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: "health,prometheus"
+```
+
+The existing `/api/health` is an application endpoint. `/actuator/health` is Actuator's health endpoint. `/actuator/prometheus` returns metrics text for Prometheus to collect. No additional Java controller is required for these Actuator endpoints.
+
+### Compose configuration
+
+Create the configuration files below before starting the containers. Add these services under the existing `services:` section of `compose.observability.yaml`:
+
+```yaml
+  prometheus:
+    image: docker.io/prom/prometheus:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,z
+      - prometheus-data:/prometheus
+    depends_on:
+      - interview-service
+
+  grafana:
+    image: docker.io/grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro,z
+    depends_on:
+      - prometheus
+```
+
+Keep a single top-level `volumes:` section:
+
+```yaml
+volumes:
+  elasticsearch-data:
+  prometheus-data:
+  grafana-data:
+```
+
+All services in this Compose configuration use its default network unless custom networks are declared. Grafana reaches Prometheus by the service name `prometheus`; Prometheus reaches the application by `interview-service`. `depends_on` sets startup ordering, not application readiness.
+
+Add these settings to the existing, untracked `.env` file beside the Compose file:
+
+```dotenv
+ELASTIC_VERSION=9.5.4
+GRAFANA_ADMIN_PASSWORD=replace-with-your-own-password
+```
+
+Commit placeholders in `.env.example`, not actual passwords. Grafana's environment password initializes a new installation; changing it does not reset an existing account in the data volume. The examples use `latest` to match the local setup; pin tested image tags for repeatable builds.
+
+### Prometheus configuration
+
+Create `observability/prometheus/prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: interview-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["interview-service:8080"]
+```
+
+`localhost:9090` refers to Prometheus itself. `interview-service:8080` refers to the application container on the shared network.
+
+If Java runs directly in the same Ubuntu WSL2 environment instead of a container, change only the application target to `host.containers.internal:8080`. This uses Podman's host-access address; verify it is reachable in your networking setup. Start Prometheus with `--no-deps` so Compose does not start a competing application container on port 8080. Restore `interview-service:8080` when returning to container execution.
+
+### Grafana data source configuration
+
+Create `observability/grafana/datasources.yml`:
+
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+```
+
+Grafana creates this data source at startup. Inside Grafana's container, `localhost` refers to Grafana itself, so use `http://prometheus:9090` for this connection.
+
+### Start and validate
+
+Run commands inside Ubuntu WSL2 from the project folder. Use the explicit Compose filename consistently, including for logs, to avoid loading a different default file.
+
+```bash
+mvn clean verify
+podman compose -f compose.observability.yaml up -d --build
+podman compose -f compose.observability.yaml ps
+```
+
+The Maven build creates the JAR needed when `Dockerfile.java21` copies from `target/`. Stop any locally running application first to free port 8080.
+
+| Check | Address or command | Expected result |
+| --- | --- | --- |
+| Application health | `curl http://localhost:8080/api/health` | Application health response |
+| Actuator health | `curl http://localhost:8080/actuator/health` | `{"status":"UP"}` when checks pass |
+| Application metrics | `curl http://localhost:8080/actuator/prometheus` | Metric names and numeric values |
+| Prometheus targets | <http://localhost:9090/targets> | Application target shows `UP` |
+| Prometheus queries | <http://localhost:9090/query> | Queries return collected data |
+| Grafana | <http://localhost:3001> | Login with `admin` and the configured password |
+| Kibana | <http://localhost:5601> | Discover can search logs once ingestion and the data view are configured |
+
+In Prometheus or Grafana Explore, run:
+
+```promql
+up{job="interview-service"}
+```
+
+A value of `1` means the most recent scrape succeeded; `0` means it failed. This checks collection, rather than every aspect of application health. For a failed scrape, inspect the target error on the Prometheus targets page.
+
+Heap memory used, in MiB:
+
+```promql
+sum(jvm_memory_used_bytes{job="interview-service", area="heap"}) / 1024 / 1024
+```
+
+Heap plus non-heap pool memory used, in MiB:
+
+```promql
+sum(jvm_memory_used_bytes{job="interview-service"}) / 1024 / 1024
+```
+
+These queries assume the current single application instance. For multiple instances, use `sum by (instance) (...)` to keep a separate line per instance. Individual memory pools produce separate lines when using the raw `jvm_memory_used_bytes` metric. Select a 15-minute range; a one-second graph cannot show meaningful changes with 15-second collection.
+
+### Save a Grafana memory dashboard
+
+1. Open Grafana and log in.
+2. Open **Connections → Data sources → Prometheus** and test the connection.
+3. Open **Dashboards → New → New dashboard → Add visualization** and select Prometheus.
+4. Switch the query editor to **Code** and enter the heap-memory query above.
+5. Select a **Time series** visualization, title it **Interview Service — Heap Memory**, and set its unit to **MiB** because the query already converts bytes.
+6. Return to the dashboard and save it as **Interview Service Monitoring**.
+7. Select **Last 15 minutes** and an available refresh interval of **15s**.
+
+Button names can vary with the Grafana image version. Explore is useful for trying queries; save a dashboard panel to retain a chart. Dashboards, users, and settings persist in `grafana-data`.
+
+## Podman Compose cheat sheet
+
+Use `compose.observability.yaml` explicitly. If your actual filename differs, substitute it in every command. `podman compose` delegates to an installed Compose provider such as `podman-compose`; the provider announcement is informational.
+
+### Manage the stack and individual services
+
+| Task | Command |
+| --- | --- |
+| Show configured service names | `podman compose -f compose.observability.yaml config --services` |
+| Start the whole stack in the background | `podman compose -f compose.observability.yaml up -d` |
+| Show Compose container status | `podman compose -f compose.observability.yaml ps` |
+| Show all running Podman containers | `podman ps` |
+| Show running and stopped containers | `podman ps -a` |
+| Stop the stack, retaining containers | `podman compose -f compose.observability.yaml stop` |
+| Start existing stopped containers | `podman compose -f compose.observability.yaml start` |
+| Stop and remove stack containers and its network | `podman compose -f compose.observability.yaml down` |
+| Stop only the application | `podman compose -f compose.observability.yaml stop interview-service` |
+| Start its existing stopped container | `podman compose -f compose.observability.yaml start interview-service` |
+| Restart only the application | `podman compose -f compose.observability.yaml restart interview-service` |
+| Create/start only Grafana without dependencies | `podman compose -f compose.observability.yaml up -d --no-deps grafana` |
+| Recreate only Prometheus | `podman compose -f compose.observability.yaml up -d --no-deps --force-recreate prometheus` |
+
+`up` creates containers when needed; `start` starts existing stopped containers; `restart` restarts the existing container and does not rebuild its image or apply changed Compose environment settings. `--no-deps` skips dependency startup. The final argument is a Compose **service name**, not a container ID or Prometheus scrape target.
+
+Ordinary `down` preserves the declared named data volumes. **`down -v` deletes these volumes and their stored data**; do not use it for a normal restart. Keep the same Compose project name to reuse the same automatically prefixed volumes. Stopping the application makes its Prometheus target `DOWN` until it returns and a scrape succeeds.
+
+### Rebuild only the Java application
+
+```bash
+mvn clean verify
+podman compose -f compose.observability.yaml build interview-service
+podman compose -f compose.observability.yaml up -d --no-deps --force-recreate interview-service
+```
+
+The other running services continue running. The image is named `interview-service:java21`. To verify it:
+
+```bash
+podman images interview-service
+```
+
+### Inspect and follow logs
+
+```bash
+# Recent application console logs
+podman compose -f compose.observability.yaml logs --tail=50 interview-service
+
+# Follow logs continuously; Ctrl+C stops viewing, not the service
+podman compose -f compose.observability.yaml logs -f --tail=50 interview-service
+
+# Follow Grafana logs
+podman compose -f compose.observability.yaml logs -f --tail=50 grafana
+
+# View Filebeat activity and forwarding errors
+podman compose -f compose.observability.yaml logs --tail=50 filebeat
+```
+
+For a container ID or name from `podman ps`, use the direct command:
+
+```bash
+podman logs -f --tail=50 <container-id-or-name>
+```
+
+Do not pass a container ID to `podman compose logs`. If Compose reports `missing services [grafana]` while a Grafana container exists, check the selected Compose filename and `config --services` output.
+
+### Enter a container and inspect log files
+
+Open a shell in the running application container (this is not a separate VM login):
+
+```bash
+podman compose -f compose.observability.yaml exec interview-service sh
+```
+
+Inside that shell:
+
+```sh
+ls -l /app/logs
+tail -n 50 /app/logs/interview.log
+tail -f /app/logs/interview.log
+```
+
+Use `Ctrl+C` to stop following, then `exit` to leave the shell. These commands assume the image includes `sh`, `ls`, and `tail`; minimal images may omit them.
+
+Read the same bind-mounted application file directly from Ubuntu:
+
+```bash
+tail -n 50 ./logs/interview.log
+tail -f ./logs/interview.log
+```
+
+View the configuration visible inside Filebeat:
+
+```bash
+podman compose -f compose.observability.yaml exec filebeat cat /usr/share/filebeat/filebeat.yml
+```
+
+Container console output (`podman logs`) and application file output (`interview.log`) are different destinations. Filebeat reads the mounted application files; its own console logs describe collection and forwarding activity. Search forwarded application logs in Kibana Discover using the data view configured for the Logstash output index.
+
+### Mounting and labels
+
+A mount makes storage outside a container accessible at a path inside it. The form is `source:container-path:options`.
+
+| Example | Type and purpose |
+| --- | --- |
+| `./logs:/app/logs:z` | Bind mount: project log directory is available inside the application |
+| `./logs:/logs:ro,z` | Bind mount: Filebeat reads that same directory |
+| `./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,z` | Bind mount: a specific configuration file is supplied from the project |
+| `prometheus-data:/prometheus` | Named volume: Podman-managed storage for metrics |
+| `grafana-data:/var/lib/grafana` | Named volume: Podman-managed storage for dashboards and settings |
+
+Relative bind-mount paths are resolved from the Compose project/file directory in this setup. Create source configuration files before starting the services. Named volume data is outside the container's writable layer and is not written into the image; it survives container replacement when the same volume is reused.
+
+| Option | Meaning |
+| --- | --- |
+| `ro` | Read-only inside the container |
+| `rw` | Read/write; normally the default |
+| `z` | On SELinux systems, relabel for sharing among containers |
+| `Z` | On SELinux systems, relabel for private container use (containers within one Pod share its SELinux label) |
+
+SELinux labeling is separate from normal Unix file permissions and from read-only access. Ubuntu WSL2 typically does not have SELinux enforcing, so `z`/`Z` are usually unnecessary there. For shared application/Filebeat logs on an enforcing SELinux host, use shared `z` labeling on both mounts. Relabel only intended project paths. These mount suffixes are different from Compose/container metadata `labels:`.
+
+Inspect the actual named volume and its location:
+
+```bash
+podman volume ls
+podman volume inspect <actual-volume-name>
+```
+
+Compose normally prefixes volume names with the project name, for example `ai-engineering-assistant_grafana-data`. Recreating containers does not delete this storage; deleting the volume or the WSL distribution containing it does.
+
+### Configuration changes and troubleshooting
+
+* After editing the mounted `prometheus.yml`, restart Prometheus: `podman compose -f compose.observability.yaml restart prometheus`.
+* After editing `datasources.yml`, restart Grafana: `podman compose -f compose.observability.yaml restart grafana`.
+* After changing a Compose environment setting or mount, apply it with `up -d --no-deps --force-recreate SERVICE` using the explicit Compose filename.
+* A `404` from `/actuator/prometheus` usually means the dependencies or endpoint exposure are missing, or the running image has not been rebuilt.
+* When a target is `DOWN`, inspect the Prometheus targets error. Inside the shared network use `interview-service:8080`; for a local Ubuntu process use a verified host-access address.
+* Use the service-specific console logs to investigate startup errors. Confirm source files exist and the container can read them before changing permissions.
+
+### Official references
+
+* [Spring Boot 3.5 Actuator endpoints](https://docs.spring.io/spring-boot/3.5/reference/actuator/endpoints.html)
+* [Spring Boot 3.5 metrics](https://docs.spring.io/spring-boot/3.5/reference/actuator/metrics.html)
+* [Prometheus configuration](https://prometheus.io/docs/prometheus/latest/configuration/configuration/)
+* [Grafana provisioning](https://grafana.com/docs/grafana/latest/administration/provisioning/)
+* [Podman Compose](https://docs.podman.io/en/stable/markdown/podman-compose.1.html)
+* [Podman mounts and SELinux options](https://docs.podman.io/en/stable/markdown/podman-run.1.html)
 
 ## Issues encountered and resolutions
 
@@ -174,7 +531,7 @@ The single-container application works successfully with rootless `pasta` networ
 | Java 21 runtime image was required                      | The application requires Java 21                                              | Used the Eclipse Temurin Java 21 runtime image                                                                  |
 | Container image required the built application artifact | Maven generates the Spring Boot JAR in `target`                               | Copied `target/interview-0.0.1-SNAPSHOT.jar` into the image                                                     |
 | Podman rootful network error                            | `netavark` / `nftables` failed with rootful networking                        | Switched to rootless mode and validated single-container execution with `pasta`                                 |
-| ELK Compose bridge-network error                        | Podman-on-WSL bridge networking remains affected by `netavark` / `nftables`   | Kept the Compose configuration and image-download workflow; continued using the native Windows ELK installation |
+| Earlier multi-container Compose bridge-network error | `netavark` / `nftables` error in the earlier Windows/Podman Desktop environment | On another laptop, Podman installed directly inside Ubuntu WSL2 ran the stack without this error; original environment remains unverified |
 | `useradd` build step failed                             | Podman encountered a network error while starting a temporary build container | Simplified the initial Dockerfile; non-root execution can be added after full network validation                |
 
 ## Evidence
@@ -226,19 +583,18 @@ Do not include passwords, tokens, Jenkins credentials, or internal URLs in scree
 ## Current status
 
 * Jenkins CI pipeline configured and validated with a controlled unit-test failure.
-* Java 21 application image successfully built with Podman.
-* Single-container application execution validated with rootless `pasta` networking.
-* ELK images successfully downloaded using `compose.observability.yaml`.
-* Native Windows ELK installation remains the active local observability runtime.
-* ELK Compose startup is pending resolution of the Podman/WSL bridge-network limitation.
-* https://github.com/containers/netavark/issues/1495?utm_source=chatgpt.com
-
+* Java 21 application image built and run with Podman.
+* All seven application and observability containers observed running in the current Ubuntu WSL2 environment.
+* Spring Boot Actuator health and Prometheus endpoints enabled.
+* Prometheus application scraping and Grafana metrics queries validated locally.
+* Earlier Windows/Podman Desktop multi-container networking issue documented separately; the current Ubuntu WSL2 setup did not reproduce it.
+* Kubernetes learning continues separately with Kind and the Nginx workload.
 
 ## Kubernetes learning with Kind in Ubuntu WSL2
 
 Kubernetes learning is intentionally being introduced in small, verifiable steps before deploying the Java `interview-service`. The first workload is Nginx, which separates Kubernetes concepts from Spring Boot troubleshooting.
 
-ELK remains outside Kubernetes in this phase. The existing Podman Compose/native Windows ELK workflow is unchanged.
+ELK, Prometheus, and Grafana remain outside Kubernetes in this phase. The current observability runtime is Podman Compose inside Ubuntu WSL2; the native Windows ELK runtime belongs to the earlier environment.
 
 ### Prerequisites for local Kubernetes
 
