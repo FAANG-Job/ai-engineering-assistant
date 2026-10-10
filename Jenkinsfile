@@ -1,18 +1,19 @@
 pipeline {
     agent any
-	tools {
-		maven 'Maven'
-	}
+
     stages {
         stage('Build JAR') {
             steps {
-                bat 'mvn -B clean package -DskipTests'
-            }
-        }
+                bat '''
+@echo off
+setlocal
+set "JAVA_HOME=C:\\work\\FAANG-JOBS\\jdk-21.0.12.1"
+set "MAVEN_HOME=C:\\work\\automation\\apache-maven-4.0.0-rc-3"
+set "PATH=%JAVA_HOME%\\bin;%MAVEN_HOME%\\bin;%PATH%"
 
-        stage('Archive JAR') {
-            steps {
-                archiveArtifacts artifacts: 'target/*.jar'
+call mvn -B clean package -DskipTests
+exit /b %errorlevel%
+'''
             }
         }
     }
