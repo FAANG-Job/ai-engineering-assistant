@@ -14,7 +14,8 @@ set "MAVEN_HOME=C:\\work\\automation\\apache-maven-4.0.0-rc-3"
 set "PATH=%JAVA_HOME%\\bin;%MAVEN_HOME%\\bin;%PODMAN_HOME%;%PATH%"
 
 whoami
-podman system connection list
+whoami
+echo USERPROFILE=%USERPROFILE%
 
 REM Verify Podman connectivity
 podman info
