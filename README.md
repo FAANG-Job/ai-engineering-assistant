@@ -1,3 +1,4 @@
+Rohitaggarwal200@gmail.com - Lead Principal engineer
 # Interview
 
 A Java 21 Spring Boot REST API with Jenkins CI, Podman containerization, ELK logging, and Prometheus/Grafana monitoring. The current multi-container setup runs with Podman installed directly in Ubuntu WSL2.
