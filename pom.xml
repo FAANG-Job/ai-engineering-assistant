@@ -27,6 +27,12 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
+        <!-- Validates OAuth 2.0 access tokens, including signed JWTs -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+
     <!-- Exposes application health and metrics endpoints -->
     <dependency>
         <groupId>org.springframework.boot</groupId>
